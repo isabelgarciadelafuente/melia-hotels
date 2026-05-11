@@ -1,0 +1,6 @@
+melia.db
+melia.db-shm
+melia.db-wal
+__pycache__/
+*.pyc
+.DS_Store

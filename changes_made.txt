@@ -1,0 +1,305 @@
+==============================================================================
+MELIA HOTELS — CHANGES IN v5 vs ORIGINAL Project/
+==============================================================================
+
+ARCHITECTURAL PRINCIPLE
+-----------------------
+schema.py owns ALL business logic (math, pricing, side-effects, integrity).
+data.py performs ONLY INSERTs of inputs. Triggers compute everything else.
+The form-app and the cancel page are pure clients of the schema — they do
+INSERT INTO Booking / UPDATE Booking and let the trigger system handle
+all derived data.
+
+
+==============================================================================
+HEADLINE CHANGES IN v5
+==============================================================================
+
+  1. Calendar window shifted from 2023–2025 to 2025–2027 so that "today"
+     (the real current date) sits inside the data range. This makes the
+     booking form and the cancellation page meaningful again — there are
+     genuinely upcoming bookings to make and to cancel.
+
+  2. Synthetic booking status is now determined by check_out vs today,
+     not by a random roll:
+         check_out < today  →  'completed'
+         check_out >= today →  'confirmed'
+         7 % chance of 'cancelled' regardless
+     Result: no booking ever ends up in an inconsistent state like
+     "confirmed but the stay finished a year ago".
+
+  3. The 18 hardcoded manual bookings are gone. So are the 15 hardcoded
+     customers and 8 hardcoded members that backed them. The dataset is
+     now generated entirely by the synthetic block: 45 customers,
+     ~14 members, ~52 000 bookings.
+
+  4. Year weights tilted toward the past so most bookings are
+     'completed' history rather than 'confirmed' future:
+         YEAR_W = [0.45, 0.35, 0.20]  for [2025, 2026, 2027]
+
+
+==============================================================================
+schema.py
+==============================================================================
+
+  + Path unified
+        DB_PATH = Path(__file__).parent / "melia.db"
+        (was a hardcoded absolute path pointing to the colleague's machine)
+
+  + Calendar config exposed at the top of the file
+        CALENDAR_START = "2025-01-01"
+        CALENDAR_END   = "2027-12-31"
+
+  + Booking: listed_price and total_paid have DEFAULT 0
+        Reason: data.py inserts these as placeholders; the
+        trg_booking_after_insert trigger overwrites them with the
+        computed values. The CHECK (>= 0) is satisfied by the placeholder.
+
+  + NEW VIEW: v_calendar_days
+        One row per day in the calendar window. Used by data.py to
+        populate RoomDay via INSERT-SELECT.
+
+  + EXISTING VIEW retained: v_room_day_price
+        Single source of truth for the dynamic nightly price formula.
+
+  + NEW TRIGGER: trg_booking_after_insert (consolidated, 9 sequential steps)
+        After each Booking insert it computes listed_price, total_paid,
+        points_earned; populates BookingModifier; creates the Invoice;
+        flips RoomDay.status to 'occupied'; and credits MeliaRewards
+        points if the booking is 'completed'.
+
+  + NEW TRIGGER: trg_booking_check_availability scoped to active bookings
+        WHEN NEW.booking_status IN ('confirmed', 'completed').
+        Cancelled bookings are exempt — they are historical records of
+        aborted reservations and don't claim the room.
+
+  + NEW TRIGGER: trg_block_completed_cancel
+        BEFORE UPDATE on Booking; aborts when 'completed' → 'cancelled'.
+        Once a guest has stayed, the booking is a historical fact —
+        refunds and disputes happen via different processes, never by
+        retroactively cancelling the stay.
+
+  + NEW TRIGGER: trg_booking_after_cancel
+        AFTER UPDATE on Booking, fires only on 'confirmed' → 'cancelled'.
+        ('completed' → 'cancelled' is blocked upstream.)
+          - NULL-outs Booking.points_earned
+          - frees the affected RoomDay nights ('occupied' → 'available')
+          - marks the linked Invoice as 'refunded'
+
+  + NEW TRIGGER: trg_booking_after_complete
+        AFTER UPDATE on Booking, fires on 'confirmed' → 'completed'.
+        Credits MeliaRewards.points_balance with the points_earned
+        that were pre-computed at INSERT time but not yet awarded.
+
+  + NEW TRIGGER: trg_room_base_rate_changed
+        AFTER UPDATE OF base_rate on Room.
+        Recomputes every RoomDay row of that room via v_room_day_price.
+
+  + 5 NEW INDEXES on hot query paths:
+        idx_booking_customer  (Booking.customer_id)
+        idx_booking_dates     (Booking.check_in, check_out)
+        idx_booking_status    (Booking.booking_status)
+        idx_bm_modifier       (BookingModifier.modifier_id)
+        idx_invoice_status    (Invoice.status)
+
+  Existing items retained (unchanged in v5):
+        - All CREATE TABLE statements with their CHECK constraints.
+        - Triggers: trg_pm_after_insert / _update / _delete
+
+  Total trigger count vs original: 0 → 9.
+
+
+==============================================================================
+data.py
+==============================================================================
+
+  + Path unified.
+
+  - REMOVED: the 18 manual bookings, the 15 manual customers and the
+        8 manual MeliaRewards members that backed them.
+
+  - REMOVED: Block D (Python recursive-CTE-by-hand calendar generator).
+        Replaced by an INSERT-SELECT against v_calendar_days.
+
+  - REMOVED: All Python pricing math.
+        compute_price(), member_mod() and the loop that calculated
+        listed/net/total/points/tax for each synthetic booking — gone.
+        The schema trigger handles it.
+
+  - REMOVED: SOL_HOTEL_IDS hack and the manual special-case for
+        booking 18's two out-of-range RoomDay rows.
+
+  + Synthetic generation status determined by date (NEW v5):
+        if rand() < 0.07:        status = 'cancelled'
+        elif check_out < today:  status = 'completed'
+        else:                    status = 'confirmed'
+        No more random/inconsistent assignment.
+
+  + YEARS = [2025, 2026, 2027], YEAR_W = [0.45, 0.35, 0.20]
+        Past-tilted weighting produces realistic data: roughly two
+        thirds of stays are 'completed' history, one third 'confirmed'
+        upcoming reservations.
+
+  + Bookings inserted in CHRONOLOGICAL order (sorted by check_in).
+        Preserves the time-evolution of MeliaRewards.points_balance and
+        member tier resolution.
+
+  + Insertion order is strictly:
+        Brands → Hotel → Room → RoomDay → PriceModifier →
+        Customer → MeliaRewards → Booking
+
+  + PriceModifier set extended from 23 to 44 rows
+        Brand-wide duplication of:
+          - "Tarifa Fin de Semana ME"  — 4 ME hotels  × 3 years (25/26/27)
+          - "Cargo Limpieza Sol"        — 4 Sol hotels × 3 years (25/26/27)
+          - "Bono Bienvenida Sol"       — 4 Sol hotels × 1 range (25-27)
+        Member tier modifiers (6, 7, 8, 9) cover the full 2025-2027 range.
+
+  + Block 5 bulk-load optimisation for PriceModifier
+        Drops the trg_pm_* triggers, bulk-inserts all 44 modifiers,
+        runs ONE UPDATE that recomputes ALL RoomDay.price_per_day from
+        v_room_day_price, then restores the triggers. ~50× faster than
+        firing the trigger 44 times in cascade.
+
+
+==============================================================================
+quality_checks.py
+==============================================================================
+
+  + Path unified.
+
+  + Expected counts updated to v5 dataset:
+        PriceModifier: 44
+        Customer:      45
+        MeliaRewards:  14   (40 % of 35 direct customers, deterministic)
+        RoomDay:       rooms × 1 095 (no leap year in 2025-2027)
+        Booking:       ≥50 000
+        BookingModifier: ≥30 000
+
+  + NEW SECTION: [7] Trigger correctness
+        Verifies the AFTER INSERT trigger did its job:
+          - listed_price was filled in
+          - total_paid was filled in
+          - listed_price = SUM(RoomDay.price_per_day) per booking
+          - Booking.total_paid = Invoice.total_paid
+          - Invoice: net + tax = total
+          - Invoice tax_amount = net × tax_rate
+          - Every booking has exactly one Invoice
+          - Every 'occupied' RoomDay row is justified by an active
+              booking (uses an indexed temp table for performance)
+          - Cancelled bookings carry NULL points_earned
+          - Non-member bookings carry NULL points_earned
+
+
+==============================================================================
+analytics.py
+==============================================================================
+
+  + Path unified.
+
+  + KPI 7 corrected (was counting surcharges as discounts)
+        The "has_discount" flag now requires discount_value < 0, so
+        surcharges (Temporada Alta, Cargo Sol, ME weekend) no longer
+        inflate the discount-uptake metric.
+
+  + KPI 7b reformatted as "Top modifiers by usage", split between
+        discounts and surcharges via a derived 'effect' column.
+
+  + NEW KPIs:
+        KPI 9  — Cancellation Rate by customer type × channel and by
+                 brand segment.
+        KPI 10 — Occupancy Rate (year × segment, top 10 hotels).
+                 Reads RoomDay.status which is reliably maintained by
+                 the trigger system.
+        KPI 11 — Revenue Lost to Cancellations (Invoice.net_amount of
+                 refunded invoices, by year × segment).
+
+  + KPI 8 reference date changed from hardcoded '2025-12-31' to
+        julianday('now') so churn is always measured relative to today.
+
+
+==============================================================================
+streamlit_app.py
+==============================================================================
+
+  + Path unified (was already correct).
+
+  + has_discount flag corrected (matches KPI 7 fix above).
+
+  + NEW Overview KPI cards: Cancellation Rate, Occupancy Rate
+        (extended the row from 5 to 6 metrics).
+
+  + NEW tab: Operations
+        - Cancellation rate by channel and by brand segment
+        - Revenue lost to cancellations per year
+        - Occupancy heatmap (segment × month, blue colourscale)
+        - Top 10 hotels by occupancy
+        Reads from a new occupancy DataFrame loaded once in load_all().
+
+  + Reference date for "days_inactive" / churn calculation switched
+        from hardcoded pd.Timestamp('2025-12-31') to
+        pd.Timestamp.today().normalize().
+
+  + Caption updated: "Data: 2025–2027".
+
+
+==============================================================================
+NEW FILES
+==============================================================================
+
+  pages/1_Make_Booking.py
+        Streamlit multipage booking form. 5-step wizard:
+          1. Search availability   (date pickers bounded to v_calendar_days
+                                    AND to today — no booking in the past)
+          2. Browse rooms          (only rooms available for every requested night)
+          3. Identify customer     (existing by email, or new with optional
+                                    MeliáRewards enrollment)
+          4. Confirm + breakdown   (3-step price breakdown:
+                                    listed → adjustments → tax)
+          5. Done                  (full invoice + "Make another booking")
+        The form is a pure client of the schema: it INSERTs into Booking
+        and lets the triggers compute pricing, BookingModifier rows,
+        Invoice, RoomDay status, and points.
+
+  pages/2_Cancel_Booking.py
+        Streamlit cancellation page. Simple flow optimised for real-world
+        usability — no booking IDs to remember.
+          1. Customer types only their email and clicks "Find my bookings".
+          2. The page lists every cancellable booking
+                 (status='confirmed' AND check_in > today).
+             In-progress stays, past bookings and existing cancellations
+             are hidden.
+          3. Click [Cancel] on a card → modal dialog asks for a reason
+             (dropdown of common reasons + "Other..." → free text).
+          4. Single SQL UPDATE — the schema triggers handle all
+             side-effects: refund invoice, free RoomDay, NULL out
+             points_earned. The list refreshes instantly.
+
+        Defence in depth: the schema also has trg_block_completed_cancel
+        which makes it impossible to cancel a 'completed' booking from
+        anywhere — the form-app filter is just for UX, not for safety.
+
+
+==============================================================================
+KNOWN LIMITATIONS
+==============================================================================
+
+  1. No periodic auto-transition of confirmed → completed.
+        At data.py runtime, every booking with check_out < today is set
+        to 'completed' (status by date). But if you wait a month without
+        re-running data.py, bookings with check_out that have crossed
+        today since the last run remain 'confirmed'. In production a
+        scheduled "tick" job would handle this; for an academic demo
+        the assumption is that data.py is run when needed and that's
+        sufficient.
+
+  2. Form-app cannot transition confirmed → completed manually.
+        The schema trigger trg_booking_after_complete exists and works
+        if you do the UPDATE via SQL, but no UI surfaces this. It would
+        be the natural counterpart to the cancellation page in a real
+        deployment.
+
+  3. Synthetic data uses random.seed(42) so counts are deterministic.
+        If you change the seed, the MeliaRewards count and the Booking
+        count may shift slightly and the corresponding hard equalities
+        in quality_checks.py would need adjustment.
