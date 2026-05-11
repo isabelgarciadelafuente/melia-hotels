@@ -8,6 +8,8 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import plotly.express as px
+import subprocess
+import sys
 from pathlib import Path
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -19,6 +21,26 @@ st.set_page_config(
 )
 
 DB_PATH = Path(__file__).parent / "melia.db"
+
+# ── Auto-setup: build DB on first launch if it doesn't exist ─────────────────
+def _db_is_ready():
+    """Returns True only if the DB exists AND has bookings in it."""
+    if not DB_PATH.exists():
+        return False
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        n = conn.execute("SELECT COUNT(*) FROM Booking").fetchone()[0]
+        conn.close()
+        return n > 0
+    except Exception:
+        return False
+
+if not _db_is_ready():
+    with st.spinner("⚙️ First launch — building database (~2 min)..."):
+        base = Path(__file__).parent
+        subprocess.run([sys.executable, str(base / "01_schema.py")], check=True)
+        subprocess.run([sys.executable, str(base / "02_data.py")],   check=True)
+    st.rerun()
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 SEGMENT_COLORS = {"Luxury": "#1B3A6B", "Premium": "#C9A84C", "Essential": "#5B8DB8"}
