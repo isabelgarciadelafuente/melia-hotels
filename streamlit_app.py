@@ -8,8 +8,6 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import plotly.express as px
-import subprocess
-import sys
 from pathlib import Path
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -21,15 +19,6 @@ st.set_page_config(
 )
 
 DB_PATH = Path(__file__).parent / "melia.db"
-
-# ── Auto-setup: generate DB on first launch if it doesn't exist ───────────────
-if not DB_PATH.exists():
-    with st.spinner("⚙️ First launch — building database (this takes ~2 minutes)..."):
-        base = Path(__file__).parent
-        subprocess.run([sys.executable, str(base / "01_schema.py")], check=True)
-        subprocess.run([sys.executable, str(base / "02_data.py")],   check=True)
-    st.success("✅ Database ready!")
-    st.rerun()
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 SEGMENT_COLORS = {"Luxury": "#1B3A6B", "Premium": "#C9A84C", "Essential": "#5B8DB8"}
@@ -117,13 +106,12 @@ def load_all():
         SELECT
             pm.name         AS modifier_name,
             pm.modifier_type,
-            CASE WHEN pm.value < 0 THEN 'discount' ELSE 'surcharge' END AS effect,
             COUNT(DISTINCT bm.booking_id) AS bookings_using
         FROM BookingModifier bm
         JOIN PriceModifier pm ON pm.modifier_id = bm.modifier_id
         JOIN Booking b ON b.booking_id = bm.booking_id
         WHERE b.booking_status IN ('confirmed','completed')
-        GROUP BY pm.modifier_id, pm.name, pm.modifier_type, effect
+        GROUP BY pm.modifier_id, pm.name, pm.modifier_type
         ORDER BY bookings_using DESC
         LIMIT 10
     """)
@@ -161,6 +149,10 @@ df["year"]        = df["year"].astype(str)
 df["adr"]         = (df["listed_price"] / df["nights"]).round(2)
 df["has_discount"] = df["booking_id"].isin(discounted_ids).astype(int)
 
+completed = df[df["booking_status"] == "completed"]
+active    = df[df["booking_status"].isin(["confirmed", "completed"])]
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.title("🏨 Meliá Analytics")
 st.sidebar.markdown("---")
@@ -188,6 +180,14 @@ mask = (
 fdf         = df[mask]
 f_completed = fdf[fdf["booking_status"] == "completed"]
 f_active    = fdf[fdf["booking_status"].isin(["confirmed", "completed"])]
+
+# Occupancy filter: only year and brand_segment apply.
+# Booking channel and customer type are properties of the booking, not of
+# the room-night, so filtering occupancy by them would be meaningless.
+focc = occupancy[
+    occupancy["year"].isin(sel_years)
+    & occupancy["brand_segment"].isin(sel_segs)
+]
 
 st.sidebar.markdown("---")
 st.sidebar.caption(f"**{len(f_active):,}** bookings match current filters.")
@@ -218,12 +218,8 @@ with tab1:
     n_total      = len(fdf)
     n_cancelled  = (fdf["booking_status"] == "cancelled").sum()
     cancel_rate  = (n_cancelled / n_total * 100) if n_total else 0.0
-    occ_filt_overview = occupancy[
-        occupancy["brand_segment"].isin(sel_segs) &
-        occupancy["year"].isin(sel_years)
-    ]
-    occupied_n   = occ_filt_overview["occupied_nights"].sum()
-    total_n      = occ_filt_overview["room_nights"].sum()
+    occupied_n   = focc["occupied_nights"].sum()
+    total_n      = focc["room_nights"].sum()
     occ_rate     = (occupied_n / total_n * 100) if total_n else 0.0
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -361,10 +357,10 @@ with tab2:
     )
     return_rate = (
         stayed.groupby("customer_type")
-        .apply(lambda g: pd.Series({
-            "customers_who_stayed": len(g),
-            "returning_customers":  (g["completed_stays"] > 1).sum(),
-        }))
+        .agg(
+            customers_who_stayed=("completed_stays", "count"),
+            returning_customers=("completed_stays", lambda x: (x > 1).sum()),
+        )
         .reset_index()
     )
     return_rate["return_rate_pct"] = (
@@ -383,12 +379,12 @@ with tab2:
     fig5.update_layout(showlegend=False, yaxis_range=[0, 100])
     col5.plotly_chart(fig5, use_container_width=True)
 
-    overall_stayed     = len(stayed)
-    overall_returning  = (stayed["completed_stays"] > 1).sum()
-    overall_rate       = overall_returning / overall_stayed * 100 if overall_stayed else 0
-    col6.metric("Overall return rate",    f"{overall_rate:.1f}%")
-    col6.metric("Customers who stayed",   f"{overall_stayed:,}")
-    col6.metric("Returning customers",    f"{int(overall_returning):,}")
+    overall_stayed    = len(stayed)
+    overall_returning = int((stayed["completed_stays"] > 1).sum())
+    overall_rate      = overall_returning / overall_stayed * 100 if overall_stayed else 0
+    col6.metric("Overall return rate",  f"{overall_rate:.1f}%")
+    col6.metric("Customers who stayed", f"{overall_stayed:,}")
+    col6.metric("Returning customers",  f"{overall_returning:,}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -517,13 +513,13 @@ with tab4:
     fig3 = px.bar(
         discounts, x="bookings_using", y="modifier_name",
         orientation="h",
-        title="Top 10 Modifiers by Usage (discount vs surcharge)",
-        color="effect",
-        color_discrete_map={"discount": "#1B3A6B", "surcharge": "#C9A84C"},
-        labels={"bookings_using": "Bookings", "modifier_name": "", "effect": "Effect"},
+        title="Top 10 Modifiers by Usage",
+        color="modifier_type",
+        color_discrete_map={"percentage": "#1B3A6B", "fixed": "#C9A84C"},
+        labels={"bookings_using": "Bookings", "modifier_name": ""},
         text_auto=",",
     )
-    fig3.update_layout(yaxis={"categoryorder": "total ascending"}, legend_title="Effect")
+    fig3.update_layout(yaxis={"categoryorder": "total ascending"}, legend_title="Type")
     st.plotly_chart(fig3, use_container_width=True)
 
     # ── KPI 8 — Churn risk ──
@@ -675,12 +671,8 @@ with tab5:
     # ── KPI 10 — Occupancy heatmap (segment × month) ───────────────────────
     st.markdown("### Occupancy rate")
 
-    occ_filt = occupancy[
-        occupancy["brand_segment"].isin(sel_segs) &
-        occupancy["year"].isin(sel_years)
-    ]
     occ_grid = (
-        occ_filt.groupby(["brand_segment", "year_month"])
+        focc.groupby(["brand_segment", "year_month"])
         .agg(occupied=("occupied_nights", "sum"), total=("room_nights", "sum"))
         .reset_index()
     )
@@ -702,11 +694,7 @@ with tab5:
 
     # ── Top hotels by occupancy ────────────────────────────────────────────
     top_hotels = (
-        occupancy[
-            occupancy["brand_segment"].isin(sel_segs) &
-            occupancy["year"].isin(sel_years)
-        ]
-        .groupby(["hotel_name", "brand_segment"])
+        focc.groupby(["hotel_name", "brand_segment"])
         .agg(occupied=("occupied_nights", "sum"), total=("room_nights", "sum"))
         .reset_index()
     )
