@@ -8,8 +8,7 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import plotly.express as px
-import subprocess
-import sys
+import runpy
 from pathlib import Path
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -38,8 +37,8 @@ def _db_is_ready():
 if not _db_is_ready():
     with st.spinner("⚙️ First launch — building database (~2 min)..."):
         base = Path(__file__).parent
-        subprocess.run([sys.executable, str(base / "01_schema.py")], check=True)
-        subprocess.run([sys.executable, str(base / "02_data.py")],   check=True)
+        runpy.run_path(str(base / "01_schema.py"))
+        runpy.run_path(str(base / "02_data.py"))
     st.rerun()
 
 # ── Colour palette ────────────────────────────────────────────────────────────
